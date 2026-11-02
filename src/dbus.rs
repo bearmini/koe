@@ -4,10 +4,21 @@ use zbus::{connection, interface, object_server::SignalEmitter, Connection};
 ///
 /// Exposed on the session bus at `com.github.koe.Daemon`
 /// with object path `/com/github/koe/Daemon`.
-struct KoeDaemon;
+struct KoeDaemon {
+    state: String,
+}
 
 #[interface(name = "com.github.koe.Daemon")]
 impl KoeDaemon {
+    /// The current daemon state (Idle, Recording, Processing, Typing), so a
+    /// client that starts mid-recording can show it without waiting for the
+    /// next `StateChanged`. Updates are delivered by `StateChanged`, not by
+    /// `PropertiesChanged`.
+    #[zbus(property(emits_changed_signal = "false"))]
+    async fn state(&self) -> String {
+        self.state.clone()
+    }
+
     /// Emitted when the daemon state changes (Idle, Recording, Processing, Typing).
     #[zbus(signal)]
     async fn state_changed(emitter: &SignalEmitter<'_>, state: &str) -> zbus::Result<()>;
@@ -28,19 +39,25 @@ impl DbusEmitter {
     pub async fn new() -> zbus::Result<Self> {
         let connection = connection::Builder::session()?
             .name("com.github.koe.Daemon")?
-            .serve_at("/com/github/koe/Daemon", KoeDaemon)?
+            .serve_at(
+                "/com/github/koe/Daemon",
+                KoeDaemon {
+                    state: "Idle".to_string(),
+                },
+            )?
             .build()
             .await?;
         Ok(Self { connection })
     }
 
-    /// Emit a `StateChanged` signal with the given state string.
+    /// Record the new state and emit a `StateChanged` signal for it.
     pub async fn emit_state_changed(&self, state: &str) {
         let object_server = self.connection.object_server();
         if let Ok(iface_ref) = object_server
             .interface::<_, KoeDaemon>("/com/github/koe/Daemon")
             .await
         {
+            iface_ref.get_mut().await.state = state.to_string();
             let ctxt = iface_ref.signal_emitter();
             let _ = KoeDaemon::state_changed(ctxt, state).await;
         }

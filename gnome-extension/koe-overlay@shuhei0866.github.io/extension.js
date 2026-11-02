@@ -198,12 +198,14 @@ export default class KoeOverlayExtension extends Extension {
         this._overlay = new KoeOverlay();
         const bus = Gio.DBus.session;
 
+        this._sawStateSignal = false;
         this._signalId = bus.signal_subscribe(
             BUS_NAME, INTERFACE, null, OBJECT_PATH, null,
             Gio.DBusSignalFlags.NONE,
             (_conn, _sender, _path, _iface, signal, params) => {
                 if (signal === 'StateChanged') {
                     const [state] = params.deepUnpack();
+                    this._sawStateSignal = true;
                     this._overlay.setState(state);
                 } else if (signal === 'AudioLevel') {
                     const [level] = params.deepUnpack();
@@ -215,9 +217,38 @@ export default class KoeOverlayExtension extends Extension {
         this._watchId = Gio.bus_watch_name(
             Gio.BusType.SESSION, BUS_NAME, Gio.BusNameWatcherFlags.NONE,
             null, () => this._overlay?.hideNow());
+
+        this._readCurrentState();
+    }
+
+    // Signals only report changes, so if the extension is enabled (or the
+    // Shell restarts) mid-recording, ask the daemon for its current state.
+    _readCurrentState() {
+        this._cancellable = new Gio.Cancellable();
+        Gio.DBus.session.call(
+            BUS_NAME, OBJECT_PATH, 'org.freedesktop.DBus.Properties', 'Get',
+            new GLib.Variant('(ss)', [INTERFACE, 'State']),
+            new GLib.VariantType('(v)'),
+            Gio.DBusCallFlags.NONE, -1, this._cancellable,
+            (conn, result) => {
+                let state;
+                try {
+                    const [value] = conn.call_finish(result).deepUnpack();
+                    state = value.deepUnpack();
+                } catch {
+                    // Daemon not running, an older daemon without the
+                    // property, or the call was cancelled by disable().
+                    return;
+                }
+                // A StateChanged that arrived meanwhile is newer than this reply.
+                if (this._overlay && !this._sawStateSignal && state !== 'Idle')
+                    this._overlay.setState(state);
+            });
     }
 
     disable() {
+        this._cancellable?.cancel();
+        this._cancellable = null;
         if (this._signalId) {
             Gio.DBus.session.signal_unsubscribe(this._signalId);
             this._signalId = 0;
