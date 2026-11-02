@@ -182,6 +182,35 @@ To see the recording state on screen under Wayland, install the bundled GNOME Sh
 
 Then log out and back in (GNOME on Wayland only loads new extensions at login). To remove it, run `gnome-extensions uninstall koe-overlay@shuhei0866.github.io`.
 
+#### Troubleshooting (GNOME Wayland)
+
+The desktop portal is two cooperating services: `xdg-desktop-portal` (the front end apps talk to) and `xdg-desktop-portal-gnome` (the GNOME back end that shows dialogs and delivers shortcut presses). Most problems come from the two getting out of sync.
+
+| Symptom (`journalctl --user -u koe`) | What to do |
+|---|---|
+| `Wayland voice input disconnected: ... reconnecting` and a permission dialog appears unexpectedly | GNOME closed Koe's input session. Koe reconnects on its own; approve the dialog. |
+| Log says `Wayland voice shortcut ready`, but pressing the key does nothing | Restart both portal services together, then Koe (see below). |
+| `Invalid state` or `Portal request didn't succeed with no information` | The GNOME back end crashed or is stale. Restart both portal services, then Koe. |
+| `Portal request was cancelled` / `gave up after ... reconnection attempts` | Koe stopped retrying to avoid repeated dialogs. Restart Koe. |
+
+Restart both portal services together, then Koe, and approve the dialogs:
+
+```bash
+systemctl --user restart xdg-desktop-portal-gnome xdg-desktop-portal
+systemctl --user restart koe
+```
+
+Never restart `xdg-desktop-portal` alone: the GNOME back end keeps sending shortcut presses to the old front end, so registration still succeeds but key presses never reach Koe.
+
+To find where a key press stops, watch both ends while pressing the dictation key:
+
+```bash
+keyd monitor   # only if you remap keys with keyd: is the remapped key emitted?
+dbus-monitor --session "type='signal',interface='org.freedesktop.portal.GlobalShortcuts'"   # does GNOME send Activated?
+```
+
+The binding GNOME stores for Koe is visible with `dconf dump /org/gnome/settings-daemon/global-shortcuts/`.
+
 ### Download Whisper Model
 
 ```bash
