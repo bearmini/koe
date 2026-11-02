@@ -30,7 +30,18 @@ mod indicator_bridge {
         // GNOME has no layer-shell protocol for a non-activating overlay.
         // A normal Wayland toplevel can take focus from the intended input.
         if crate::portal::is_wayland() {
-            tracing::info!("Wayland recording overlay disabled to preserve input focus");
+            let is_gnome = std::env::var("XDG_CURRENT_DESKTOP")
+                .map(|d| d.split(':').any(|s| s.eq_ignore_ascii_case("GNOME")))
+                .unwrap_or(false);
+            if is_gnome {
+                tracing::info!(
+                    "Wayland: GTK indicator disabled to preserve input focus; use the GNOME Shell extension in gnome-extension/ for an overlay"
+                );
+            } else {
+                tracing::info!(
+                    "Wayland: GTK indicator disabled to preserve input focus; no on-screen indicator is available on this desktop"
+                );
+            }
             return None;
         }
         let (tx, rx) = async_channel::bounded::<IndicatorMsg>(64);
@@ -426,7 +437,8 @@ pub async fn run_daemon(mut config: config::Config, cli_no_context: bool) -> Res
                                 if rms_rx_clone.changed().await.is_err() {
                                     break;
                                 }
-                                let level = *rms_rx_clone.borrow_and_update();
+                                let level =
+                                    crate::audio::display_level(*rms_rx_clone.borrow_and_update());
                                 if let Some(ref emitter) = dbus_emitter_clone {
                                     emitter.emit_audio_level(level as f64).await;
                                 }
