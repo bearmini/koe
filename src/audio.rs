@@ -132,6 +132,22 @@ pub fn compute_rms(samples: &[f32]) -> f32 {
     (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
 }
 
+const LEVEL_FLOOR_DB: f32 = -50.0;
+const LEVEL_CEIL_DB: f32 = -10.0;
+
+/// Map a raw RMS value to a 0.0..=1.0 display level on a decibel scale.
+///
+/// Speech RMS is typically 0.01..0.1, which is too small to animate when used
+/// linearly. -50 dBFS (near silence) maps to 0.0 and -10 dBFS (loud speech)
+/// maps to 1.0.
+pub fn display_level(rms: f32) -> f32 {
+    if !rms.is_finite() || rms <= 0.0 {
+        return 0.0;
+    }
+    let db = 20.0 * rms.log10();
+    ((db - LEVEL_FLOOR_DB) / (LEVEL_CEIL_DB - LEVEL_FLOOR_DB)).clamp(0.0, 1.0)
+}
+
 /// Audio recorder using cpal.
 pub struct AudioRecorder {
     buffer: Arc<Mutex<Vec<f32>>>,
@@ -284,6 +300,26 @@ impl AudioRecorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_display_level_bounds() {
+        assert_eq!(display_level(0.0), 0.0);
+        assert_eq!(display_level(-1.0), 0.0);
+        assert_eq!(display_level(f32::NAN), 0.0);
+        // -60 dBFS is below the floor.
+        assert_eq!(display_level(0.001), 0.0);
+        // 0 dBFS is above the ceiling.
+        assert_eq!(display_level(1.0), 1.0);
+    }
+
+    #[test]
+    fn test_display_level_speech_is_visible() {
+        // Typical speech RMS (0.01 = -40 dB, 0.1 = -20 dB) lands mid-range.
+        let quiet = display_level(0.01);
+        let normal = display_level(0.1);
+        assert!((quiet - 0.25).abs() < 1e-4, "quiet = {quiet}");
+        assert!((normal - 0.75).abs() < 1e-4, "normal = {normal}");
+    }
 
     #[test]
     fn test_compute_rms_silence() {

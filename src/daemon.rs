@@ -428,7 +428,8 @@ pub async fn run_daemon(mut config: config::Config, cli_no_context: bool) -> Res
                                 if rms_rx_clone.changed().await.is_err() {
                                     break;
                                 }
-                                let level = *rms_rx_clone.borrow_and_update();
+                                let level =
+                                    crate::audio::display_level(*rms_rx_clone.borrow_and_update());
                                 if let Some(ref emitter) = dbus_emitter_clone {
                                     emitter.emit_audio_level(level as f64).await;
                                 }
