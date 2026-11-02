@@ -55,8 +55,10 @@ pub fn start_hotkey_listener(
             let keep_alive = tx.clone();
             if let Err(error) = crate::portal::run_hotkeys(mode, key, tx).await {
                 tracing::error!("Wayland voice input unavailable: {}", error);
-                // A refusal must not trigger systemd's Restart=always and
-                // another permission dialog. Retry only on an explicit restart.
+                // run_hotkeys already reconnects after closed sessions; it only
+                // returns on refusal or after its retry budget. Exiting here would
+                // let systemd's Restart=always show another permission dialog,
+                // so wait for an explicit restart instead.
                 std::future::pending::<()>().await;
             }
             drop(keep_alive);

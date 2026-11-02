@@ -7,7 +7,7 @@ use ashpd::desktop::{
         DeviceType, KeyState, NotifyKeyboardKeysymOptions, RemoteDesktop, SelectDevicesOptions,
         StartOptions,
     },
-    CreateSessionOptions, PersistMode, Session,
+    CreateSessionOptions, PersistMode, ResponseError, Session,
 };
 use futures_util::StreamExt;
 use std::{
@@ -28,7 +28,35 @@ use crate::{
 pub const APP_ID: &str = "io.github.shuhei0866.koe";
 const SHORTCUT_ID: &str = "dictation";
 static CONNECTION: OnceCell<zbus::Connection> = OnceCell::const_new();
-static KEYBOARD: OnceCell<std::result::Result<PortalKeyboard, String>> = OnceCell::const_new();
+/// The live keyboard session, or `None` while (re)connecting or after giving up.
+static KEYBOARD: Mutex<Option<Arc<PortalKeyboard>>> = Mutex::const_new(None);
+
+/// First retry delay after a failed or closed portal session; doubles per failure.
+const RECONNECT_BASE_DELAY: Duration = Duration::from_secs(2);
+const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
+/// Consecutive failed attempts before giving up until an explicit restart.
+const RECONNECT_MAX_FAILURES: u32 = 6;
+
+/// A failure that retrying cannot fix without the user's involvement, such as a
+/// declined permission dialog. Retrying would only show the dialog again.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct Permanent(String);
+
+fn is_permanent(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<Permanent>().is_some()
+            || matches!(
+                cause.downcast_ref::<ashpd::Error>(),
+                Some(ashpd::Error::Response(ResponseError::Cancelled))
+            )
+    })
+}
+
+fn reconnect_delay(failures: u32) -> Duration {
+    let factor = 1u32 << failures.saturating_sub(1).min(5);
+    (RECONNECT_BASE_DELAY * factor).min(RECONNECT_MAX_DELAY)
+}
 
 fn wayland_session(session: Option<&str>, display: Option<&str>) -> bool {
     match session {
@@ -46,27 +74,50 @@ pub fn is_wayland() -> bool {
 }
 
 async fn connection() -> Result<&'static zbus::Connection> {
-    CONNECTION
+    let connection = CONNECTION
         .get_or_try_init(|| async {
-            let connection = zbus::Connection::session()
+            zbus::Connection::session()
                 .await
-                .context("connecting to desktop session bus")?;
-            let registry = zbus::Proxy::new(
-                &connection,
-                "org.freedesktop.portal.Desktop",
-                "/org/freedesktop/portal/desktop",
-                "org.freedesktop.host.portal.Registry",
-            )
-            .await?;
-            let options: HashMap<&str, zbus::zvariant::Value<'_>> = HashMap::new();
-            registry
-                .call::<_, _, ()>("Register", &(APP_ID, options))
-                .await
-                .context("registering Koe desktop identity; install its desktop file first")?;
-            drop(registry);
-            Ok(connection)
+                .context("connecting to desktop session bus")
         })
+        .await?;
+    ensure_registered(connection).await?;
+    Ok(connection)
+}
+
+/// Register Koe's desktop identity with the current portal process.
+///
+/// The registration belongs to the portal process, not to our connection, so a
+/// restarted portal needs it again before any new session is created.
+async fn ensure_registered(connection: &zbus::Connection) -> Result<()> {
+    static REGISTERED_OWNER: Mutex<Option<String>> = Mutex::const_new(None);
+    let owner = zbus::fdo::DBusProxy::new(connection)
+        .await?
+        .get_name_owner("org.freedesktop.portal.Desktop".try_into()?)
+        .await?
+        .to_string();
+    let mut registered = REGISTERED_OWNER.lock().await;
+    if registered.as_deref() == Some(owner.as_str()) {
+        return Ok(());
+    }
+    let registry = zbus::Proxy::new(
+        connection,
+        "org.freedesktop.portal.Desktop",
+        "/org/freedesktop/portal/desktop",
+        "org.freedesktop.host.portal.Registry",
+    )
+    .await?;
+    let options: HashMap<&str, zbus::zvariant::Value<'_>> = HashMap::new();
+    registry
+        .call::<_, _, ()>("Register", &(APP_ID, options))
         .await
+        .map_err(|error| {
+            Permanent(format!(
+                "registering Koe desktop identity; install its desktop file first: {error}"
+            ))
+        })?;
+    *registered = Some(owner);
+    Ok(())
 }
 
 struct PortalKeyboard {
@@ -119,7 +170,10 @@ impl PortalKeyboard {
             || !selected.is_clipboard_enabled()
         {
             session.close().await?;
-            anyhow::bail!("Portal did not grant keyboard-only input and clipboard access");
+            return Err(Permanent(
+                "Portal did not grant keyboard-only input and clipboard access".into(),
+            )
+            .into());
         }
         tracing::info!("Wayland keyboard input permission granted");
         let text = Arc::new(Mutex::new(String::new()));
@@ -192,18 +246,12 @@ impl PortalKeyboard {
     }
 }
 
-async fn keyboard() -> Result<&'static PortalKeyboard> {
-    // Remember refusal for this process. Typing must not cause repeated dialogs
-    // or silently fall back to XWayland after consent has been declined.
-    let result = KEYBOARD
-        .get_or_init(|| async {
-            PortalKeyboard::new()
-                .await
-                .map_err(|error| format!("{error:#}"))
-        })
-        .await;
-    result.as_ref().map_err(|error| {
-        anyhow::anyhow!("Wayland input unavailable: {error}; restart Koe to retry")
+/// The keyboard session owned by `run_hotkeys`. Pasting never opens a session
+/// itself, so typing cannot cause extra permission dialogs or silently fall
+/// back to XWayland.
+async fn keyboard() -> Result<Arc<PortalKeyboard>> {
+    KEYBOARD.lock().await.clone().ok_or_else(|| {
+        anyhow::anyhow!("Wayland input is not connected; the transcript remains in history")
     })
 }
 
@@ -356,9 +404,45 @@ pub async fn run_hotkeys(
     key: String,
     sender: mpsc::Sender<HotkeyEvent>,
 ) -> Result<()> {
+    let mut failures = 0u32;
+    loop {
+        let mut ready = false;
+        let error = connect_and_listen(&mode, &key, &sender, &mut ready)
+            .await
+            .unwrap_err();
+        if is_permanent(&error) {
+            return Err(error.context("restart Koe to retry"));
+        }
+        // A session that reached the ready state worked; its closure starts a
+        // fresh retry budget instead of counting toward giving up.
+        failures = if ready { 1 } else { failures + 1 };
+        if failures > RECONNECT_MAX_FAILURES {
+            return Err(error.context(format!(
+                "gave up after {RECONNECT_MAX_FAILURES} reconnection attempts; restart Koe to retry"
+            )));
+        }
+        let delay = reconnect_delay(failures);
+        tracing::warn!(
+            "Wayland voice input disconnected: {error:#}; reconnecting in {}s (attempt {failures}/{RECONNECT_MAX_FAILURES})",
+            delay.as_secs()
+        );
+        tokio::time::sleep(delay).await;
+    }
+}
+
+/// Open the keyboard and shortcut sessions and forward shortcut events until
+/// either session ends. Always returns the reason it stopped.
+async fn connect_and_listen(
+    mode: &HotkeyMode,
+    key: &str,
+    sender: &mpsc::Sender<HotkeyEvent>,
+    ready: &mut bool,
+) -> Result<std::convert::Infallible> {
     wait_for_unlocked_session().await?;
-    let keyboard = keyboard().await?;
-    let result = shortcut_loop(keyboard, mode, &key, sender).await;
+    let keyboard = Arc::new(PortalKeyboard::new().await?);
+    *KEYBOARD.lock().await = Some(keyboard.clone());
+    let result = shortcut_loop(&keyboard, mode, key, sender, ready).await;
+    KEYBOARD.lock().await.take();
     // Revocation or a failed bind must not leave an unused control session alive.
     let _ = keyboard.session.close().await;
     result
@@ -366,15 +450,16 @@ pub async fn run_hotkeys(
 
 async fn shortcut_loop(
     keyboard: &PortalKeyboard,
-    mode: HotkeyMode,
+    mode: &HotkeyMode,
     key: &str,
-    sender: mpsc::Sender<HotkeyEvent>,
-) -> Result<()> {
+    sender: &mpsc::Sender<HotkeyEvent>,
+    ready: &mut bool,
+) -> Result<std::convert::Infallible> {
     let portal = GlobalShortcuts::with_connection(connection().await?.clone()).await?;
     let session = portal
         .create_session(CreateSessionOptions::default())
         .await?;
-    let result = shortcut_events(keyboard, &portal, &session, mode, key, sender).await;
+    let result = shortcut_events(keyboard, &portal, &session, mode, key, sender, ready).await;
     let _ = session.close().await;
     result
 }
@@ -383,10 +468,11 @@ async fn shortcut_events(
     keyboard: &PortalKeyboard,
     portal: &GlobalShortcuts,
     session: &Session<GlobalShortcuts>,
-    mode: HotkeyMode,
+    mode: &HotkeyMode,
     key: &str,
-    sender: mpsc::Sender<HotkeyEvent>,
-) -> Result<()> {
+    sender: &mpsc::Sender<HotkeyEvent>,
+    ready: &mut bool,
+) -> Result<std::convert::Infallible> {
     let session_id: String = serde_json::from_value(serde_json::to_value(session)?)?;
     // One subscription preserves D-Bus arrival order. Selecting between two
     // per-member streams can observe a queued release before its press.
@@ -394,6 +480,12 @@ async fn shortcut_events(
     let mut signals = ordered_shortcut_signals(conn).await?;
     let mut closed = session.receive_closed().await?;
     let mut keyboard_closed = keyboard.session.receive_closed().await?;
+    // A crashed or restarted portal never sends Closed; its sessions just
+    // vanish with the old bus name owner.
+    let mut owner_changed = zbus::fdo::DBusProxy::new(conn)
+        .await?
+        .receive_name_owner_changed_with_args(&[(0, "org.freedesktop.portal.Desktop")])
+        .await?;
     tracing::info!("Waiting for Wayland voice shortcut permission");
     let shortcuts = [
         NewShortcut::new(SHORTCUT_ID, "音声入力を録音").preferred_trigger(preferred_trigger(key))
@@ -403,31 +495,33 @@ async fn shortcut_events(
         .await?
         .response()?;
     tracing::info!("Wayland voice shortcut ready");
+    *ready = true;
     let mut state = ShortcutState::default();
-    loop {
+    let reason = loop {
         let pressed = tokio::select! {
             signal = signals.next() => match signal {
                 Some(Ok(message)) => match shortcut_signal(&message, &session_id) {
                     Ok(Some(pressed)) => pressed,
                     Ok(None) => continue,
-                    Err(error) => { tracing::warn!("Invalid Wayland shortcut signal: {error}"); break; }
+                    Err(error) => break format!("invalid shortcut signal: {error}"),
                 },
-                Some(Err(error)) => { tracing::warn!("Wayland shortcut connection failed: {error}"); break; },
-                None => break,
+                Some(Err(error)) => break format!("shortcut connection failed: {error}"),
+                None => break "shortcut signal stream ended".to_string(),
             },
-            _ = closed.next() => break,
-            _ = keyboard_closed.next() => break,
+            _ = closed.next() => break "the portal closed the shortcut session".to_string(),
+            _ = keyboard_closed.next() => break "the portal closed the keyboard session".to_string(),
+            _ = owner_changed.next() => break "the portal service restarted".to_string(),
         };
-        if let Some(event) = state.event(&mode, pressed) {
-            sender
-                .send(event)
-                .context("recording event receiver disconnected")?;
+        if let Some(event) = state.event(mode, pressed) {
+            if sender.send(event).is_err() {
+                return Err(Permanent("recording event receiver disconnected".into()).into());
+            }
         }
-    }
+    };
     if state.recording {
         let _ = sender.send(HotkeyEvent::RecordStop);
     }
-    anyhow::bail!("Wayland shortcut session closed; restart Koe to reconnect")
+    anyhow::bail!("Wayland shortcut session ended: {reason}")
 }
 
 async fn ordered_shortcut_signals(conn: &zbus::Connection) -> Result<zbus::MessageStream> {
@@ -606,6 +700,25 @@ mod tests {
         assert!(!wayland_session(Some("x11"), Some("stale-wayland-0")));
         assert!(wayland_session(Some("wayland"), None));
         assert!(wayland_session(None, Some("wayland-0")));
+    }
+    #[test]
+    fn reconnect_delay_doubles_up_to_the_cap() {
+        let delays: Vec<u64> = (1..=8).map(|n| reconnect_delay(n).as_secs()).collect();
+        assert_eq!(delays, [2, 4, 8, 16, 32, 60, 60, 60]);
+    }
+    #[test]
+    fn declined_dialog_is_permanent() {
+        let cancelled = anyhow::Error::from(ashpd::Error::Response(ResponseError::Cancelled));
+        assert!(is_permanent(&cancelled.context("starting session")));
+        let refused = anyhow::Error::from(Permanent("not granted".into()));
+        assert!(is_permanent(&refused));
+    }
+    #[test]
+    fn portal_crashes_and_closed_sessions_are_retried() {
+        let crashed = anyhow::Error::from(ashpd::Error::Response(ResponseError::Other));
+        assert!(!is_permanent(&crashed));
+        let closed = anyhow::anyhow!("Wayland shortcut session ended: the portal closed it");
+        assert!(!is_permanent(&closed));
     }
     #[test]
     fn japanese_and_multiline_are_clipboard_text() {

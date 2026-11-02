@@ -1804,7 +1804,7 @@ dependencies = [
 
 [[package]]
 name = "koe"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "arboard",
