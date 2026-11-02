@@ -74,31 +74,50 @@ pub fn is_wayland() -> bool {
 }
 
 async fn connection() -> Result<&'static zbus::Connection> {
-    CONNECTION
+    let connection = CONNECTION
         .get_or_try_init(|| async {
-            let connection = zbus::Connection::session()
+            zbus::Connection::session()
                 .await
-                .context("connecting to desktop session bus")?;
-            let registry = zbus::Proxy::new(
-                &connection,
-                "org.freedesktop.portal.Desktop",
-                "/org/freedesktop/portal/desktop",
-                "org.freedesktop.host.portal.Registry",
-            )
-            .await?;
-            let options: HashMap<&str, zbus::zvariant::Value<'_>> = HashMap::new();
-            registry
-                .call::<_, _, ()>("Register", &(APP_ID, options))
-                .await
-                .map_err(|error| {
-                    Permanent(format!(
-                        "registering Koe desktop identity; install its desktop file first: {error}"
-                    ))
-                })?;
-            drop(registry);
-            Ok(connection)
+                .context("connecting to desktop session bus")
         })
+        .await?;
+    ensure_registered(connection).await?;
+    Ok(connection)
+}
+
+/// Register Koe's desktop identity with the current portal process.
+///
+/// The registration belongs to the portal process, not to our connection, so a
+/// restarted portal needs it again before any new session is created.
+async fn ensure_registered(connection: &zbus::Connection) -> Result<()> {
+    static REGISTERED_OWNER: Mutex<Option<String>> = Mutex::const_new(None);
+    let owner = zbus::fdo::DBusProxy::new(connection)
+        .await?
+        .get_name_owner("org.freedesktop.portal.Desktop".try_into()?)
+        .await?
+        .to_string();
+    let mut registered = REGISTERED_OWNER.lock().await;
+    if registered.as_deref() == Some(owner.as_str()) {
+        return Ok(());
+    }
+    let registry = zbus::Proxy::new(
+        connection,
+        "org.freedesktop.portal.Desktop",
+        "/org/freedesktop/portal/desktop",
+        "org.freedesktop.host.portal.Registry",
+    )
+    .await?;
+    let options: HashMap<&str, zbus::zvariant::Value<'_>> = HashMap::new();
+    registry
+        .call::<_, _, ()>("Register", &(APP_ID, options))
         .await
+        .map_err(|error| {
+            Permanent(format!(
+                "registering Koe desktop identity; install its desktop file first: {error}"
+            ))
+        })?;
+    *registered = Some(owner);
+    Ok(())
 }
 
 struct PortalKeyboard {
