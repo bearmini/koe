@@ -30,7 +30,9 @@ mod indicator_bridge {
         // GNOME has no layer-shell protocol for a non-activating overlay.
         // A normal Wayland toplevel can take focus from the intended input.
         if crate::portal::is_wayland() {
-            tracing::info!("Wayland recording overlay disabled to preserve input focus");
+            tracing::info!(
+                "Wayland: GTK indicator disabled to preserve input focus; use the GNOME Shell extension in gnome-extension/ for an overlay"
+            );
             return None;
         }
         let (tx, rx) = async_channel::bounded::<IndicatorMsg>(64);

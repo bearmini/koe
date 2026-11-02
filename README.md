@@ -170,7 +170,17 @@ Keep the intended text field focused while dictating. Japanese and multiline tex
 wayland_paste_shortcut = "ctrl_shift_v"
 ```
 
-Use `"ctrl_v"` for GUI applications. Automatic terminal detection and active-window context are unavailable on Wayland. The floating recording indicator is disabled to preserve the target's focus; sound feedback and history remain available. Declining or revoking a portal permission stops voice input until an explicit Koe restart, without repeated prompts or an X11 fallback.
+Use `"ctrl_v"` for GUI applications. Automatic terminal detection and active-window context are unavailable on Wayland. Koe's own floating indicator window is disabled to preserve the target's focus; sound feedback and history remain available. Declining or revoking a portal permission stops voice input until an explicit Koe restart, without repeated prompts or an X11 fallback.
+
+#### Recording overlay (GNOME Shell extension)
+
+To see the recording state on screen under Wayland, install the bundled GNOME Shell extension (GNOME Shell 50). It listens to Koe's D-Bus state signals and draws the overlay inside the Shell, so it never takes focus from the window you are dictating into.
+
+```bash
+./gnome-extension/install.sh
+```
+
+Then log out and back in (GNOME on Wayland only loads new extensions at login). To remove it, run `gnome-extensions uninstall koe-overlay@shuhei0866.github.io`.
 
 ### Download Whisper Model
 

@@ -1,0 +1,11 @@
+.koe-overlay {
+  background-color: rgba(38, 38, 38, 0.85);
+  border-radius: 12px;
+  padding: 6px 16px 4px 16px;
+}
+
+.koe-overlay-label {
+  color: #ffffff;
+  font-size: 10pt;
+  text-align: center;
+}
