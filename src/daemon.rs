@@ -30,9 +30,18 @@ mod indicator_bridge {
         // GNOME has no layer-shell protocol for a non-activating overlay.
         // A normal Wayland toplevel can take focus from the intended input.
         if crate::portal::is_wayland() {
-            tracing::info!(
-                "Wayland: GTK indicator disabled to preserve input focus; use the GNOME Shell extension in gnome-extension/ for an overlay"
-            );
+            let is_gnome = std::env::var("XDG_CURRENT_DESKTOP")
+                .map(|d| d.split(':').any(|s| s.eq_ignore_ascii_case("GNOME")))
+                .unwrap_or(false);
+            if is_gnome {
+                tracing::info!(
+                    "Wayland: GTK indicator disabled to preserve input focus; use the GNOME Shell extension in gnome-extension/ for an overlay"
+                );
+            } else {
+                tracing::info!(
+                    "Wayland: GTK indicator disabled to preserve input focus; no on-screen indicator is available on this desktop"
+                );
+            }
             return None;
         }
         let (tx, rx) = async_channel::bounded::<IndicatorMsg>(64);
