@@ -148,6 +148,32 @@ pub fn display_level(rms: f32) -> f32 {
     ((db - LEVEL_FLOOR_DB) / (LEVEL_CEIL_DB - LEVEL_FLOOR_DB)).clamp(0.0, 1.0)
 }
 
+/// Read-only handle to the samples recorded so far, for live transcription.
+#[derive(Clone)]
+pub struct LiveAudio {
+    buffer: Arc<Mutex<Vec<f32>>>,
+    sample_rate: u32,
+}
+
+impl LiveAudio {
+    /// Copy of the last `max_secs` seconds of the recording so far.
+    ///
+    /// Only the tail is copied, so the lock that the capture callback also
+    /// takes is held briefly even on long recordings.
+    pub fn snapshot_tail(&self, max_secs: usize) -> AudioData {
+        let max_len = self.sample_rate as usize * max_secs;
+        let samples = self
+            .buffer
+            .lock()
+            .map(|b| b[b.len().saturating_sub(max_len)..].to_vec())
+            .unwrap_or_default();
+        AudioData {
+            samples,
+            sample_rate: self.sample_rate,
+        }
+    }
+}
+
 /// Audio recorder using cpal.
 pub struct AudioRecorder {
     buffer: Arc<Mutex<Vec<f32>>>,
@@ -291,6 +317,15 @@ impl AudioRecorder {
         })
     }
 
+    /// Handle for reading the current recording while it is in progress.
+    /// Call after [`Self::start`], which sets the sample rate.
+    pub fn live_audio(&self) -> LiveAudio {
+        LiveAudio {
+            buffer: self.buffer.clone(),
+            sample_rate: self.sample_rate,
+        }
+    }
+
     #[allow(dead_code)]
     pub fn is_recording(&self) -> bool {
         self.stream.is_some()
@@ -300,6 +335,28 @@ impl AudioRecorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_tail_copies_only_the_last_seconds() {
+        let live = LiveAudio {
+            buffer: Arc::new(Mutex::new((0..50).map(|i| i as f32).collect())),
+            sample_rate: 10,
+        };
+        let tail = live.snapshot_tail(2);
+        assert_eq!(tail.samples.len(), 20);
+        assert_eq!(tail.samples[0], 30.0);
+        assert_eq!(*tail.samples.last().unwrap(), 49.0);
+        assert_eq!(tail.sample_rate, 10);
+    }
+
+    #[test]
+    fn snapshot_tail_returns_short_recordings_whole() {
+        let live = LiveAudio {
+            buffer: Arc::new(Mutex::new(vec![0.5; 15])),
+            sample_rate: 10,
+        };
+        assert_eq!(live.snapshot_tail(2).samples.len(), 15);
+    }
 
     #[test]
     fn test_display_level_bounds() {

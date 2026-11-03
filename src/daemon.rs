@@ -119,6 +119,108 @@ fn load_vad(config: &config::VadConfig) -> Option<Arc<vad::VoiceActivityDetector
     }
 }
 
+/// Live transcripts cover at most this much of the end of the recording, so
+/// each pass stays short on long recordings. The overlay shows the tail anyway.
+const LIVE_MAX_SECS: usize = 25;
+
+/// Lower bound for `[live] interval_ms`, so the GPU is not busy the whole
+/// recording.
+const LIVE_MIN_INTERVAL_MS: u64 = 200;
+
+/// Recordings shorter than this are not live-transcribed yet.
+const LIVE_MIN_SECS: f32 = 1.0;
+
+/// Background task that repeatedly transcribes the recording in progress and
+/// sends the text to the overlay as `LiveTranscript` D-Bus signals.
+struct LiveTranscriptTask {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    /// Wakes the task from its pause so stopping does not wait for it.
+    wake: Arc<tokio::sync::Notify>,
+    handle: JoinHandle<()>,
+}
+
+impl LiveTranscriptTask {
+    fn spawn(
+        audio: audio::LiveAudio,
+        recognizer: Arc<dyn recognition::SpeechRecognizer>,
+        detector: Option<Arc<vad::VoiceActivityDetector>>,
+        emitter: dbus::DbusEmitter,
+        interval: Duration,
+        ignore_leading_ms: u32,
+    ) -> Self {
+        use std::sync::atomic::Ordering;
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let wake_rx = Arc::clone(&wake);
+        let handle = tokio::spawn(async move {
+            let mut last = String::new();
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {}
+                    _ = wake_rx.notified() => {}
+                }
+                if stop_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+                // Bound by recording time (before VAD), so a long pause does
+                // not bring back speech from minutes ago.
+                let snapshot = audio.snapshot_tail(LIVE_MAX_SECS);
+                let secs = snapshot.samples.len() as f32 / snapshot.sample_rate.max(1) as f32;
+                if secs < LIVE_MIN_SECS {
+                    continue;
+                }
+                let speech = match &detector {
+                    Some(d) => {
+                        let d = Arc::clone(d);
+                        match tokio::task::spawn_blocking(move || {
+                            d.extract_speech(&snapshot, ignore_leading_ms)
+                        })
+                        .await
+                        {
+                            Ok(Ok(speech)) => speech,
+                            _ => continue,
+                        }
+                    }
+                    None => snapshot,
+                };
+                if speech.samples.is_empty() || stop_flag.load(Ordering::Relaxed) {
+                    continue;
+                }
+                match recognizer.transcribe(&speech).await {
+                    // Skip punctuation-only output (e.g. "、" from a short noise).
+                    Ok(text) if text != last && has_words(&text) => {
+                        emitter.emit_live_transcript(&text).await;
+                        last = text;
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::debug!("Live transcription failed: {:#}", e),
+                }
+            }
+        });
+        Self { stop, wake, handle }
+    }
+
+    /// Ask the task to stop and wait for an in-flight transcription to end.
+    async fn stop(self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.wake.notify_one();
+        let started = std::time::Instant::now();
+        if tokio::time::timeout(Duration::from_secs(3), self.handle)
+            .await
+            .is_err()
+        {
+            tracing::warn!("Live transcription did not stop within 3s");
+        }
+        tracing::info!("Live transcription stopped in {:?}", started.elapsed());
+    }
+}
+
+/// Whether `text` contains any letter or digit (kana and kanji count).
+fn has_words(text: &str) -> bool {
+    text.chars().any(char::is_alphanumeric)
+}
+
 /// How long the start cue (`message-new-instant`, about 0.43 s) can be heard
 /// by the microphone after recording starts. Short sounds that end within this
 /// window are dropped by VAD so the cue is not transcribed.
@@ -329,6 +431,7 @@ pub async fn run_daemon(mut config: config::Config, cli_no_context: bool) -> Res
 
     // Audio level forwarding task handle (active only during Recording)
     let mut audio_level_handle: Option<JoinHandle<()>> = None;
+    let mut live_task: Option<LiveTranscriptTask> = None;
     let mut active_window_id: Option<String> = None;
 
     // Set initial Whisper hint from memory
@@ -529,6 +632,26 @@ pub async fn run_daemon(mut config: config::Config, cli_no_context: bool) -> Res
                                 tokio::time::sleep(Duration::from_millis(33)).await;
                             }
                         }));
+
+                        // Live transcript for the overlay (local recognition only)
+                        if config.live.enabled && recognizer.supports_live() {
+                            if let Some(ref emitter) = dbus_emitter {
+                                live_task = Some(LiveTranscriptTask::spawn(
+                                    recorder.live_audio(),
+                                    Arc::clone(&recognizer),
+                                    vad.clone(),
+                                    emitter.clone(),
+                                    Duration::from_millis(
+                                        config.live.interval_ms.max(LIVE_MIN_INTERVAL_MS),
+                                    ),
+                                    if config.feedback.sound_enabled {
+                                        START_CUE_GUARD_MS
+                                    } else {
+                                        0
+                                    },
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -538,6 +661,9 @@ pub async fn run_daemon(mut config: config::Config, cli_no_context: bool) -> Res
                     if let Some(handle) = audio_level_handle.take() {
                         handle.abort();
                     }
+                    // Stop the microphone first, so nothing said after the
+                    // stop key ends up in the recording.
+                    let stopped = recorder.stop();
 
                     tracing::info!("<<< Recording stopped, processing...");
                     state = AppState::Processing;
@@ -552,7 +678,13 @@ pub async fn run_daemon(mut config: config::Config, cli_no_context: bool) -> Res
                     )
                     .await;
 
-                    match recorder.stop() {
+                    // Let an in-flight live transcription finish so it does
+                    // not compete with the final one for the GPU.
+                    if let Some(live) = live_task.take() {
+                        live.stop().await;
+                    }
+
+                    match stopped {
                         Ok(audio_data) => {
                             let audio_data = match &vad {
                                 Some(vad) => {
@@ -846,6 +978,9 @@ pub async fn run_daemon(mut config: config::Config, cli_no_context: bool) -> Res
     if let Some(handle) = audio_level_handle.take() {
         handle.abort();
     }
+    if let Some(live) = live_task.take() {
+        live.stop().await;
+    }
 
     // Shutdown indicator window
     #[cfg(feature = "gui")]
@@ -863,6 +998,15 @@ pub async fn run_daemon(mut config: config::Config, cli_no_context: bool) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn punctuation_only_text_has_no_words() {
+        assert!(!has_words("、"));
+        assert!(!has_words(" 。… "));
+        assert!(has_words("えーと"));
+        assert!(has_words("OK"));
+        assert!(has_words("漢字"));
+    }
 
     #[test]
     fn test_app_state_display_idle() {
