@@ -1,0 +1,19 @@
+[Unit]
+Description=Koe - Japanese voice input for Ubuntu
+After=graphical-session.target
+PartOf=graphical-session.target
+# Stop retrying when Koe keeps failing (e.g. no Whisper model downloaded yet)
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# The user manager does not see variables exported in a shell. Put API keys
+# in the GNOME keyring (see README) or in this optional file (KEY=value lines).
+EnvironmentFile=-%h/.config/koe/env
+ExecStart=/usr/bin/koe
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target
