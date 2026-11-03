@@ -79,6 +79,7 @@ impl Widgets {
                 openai_api: Some(OpenAiApiConfig {
                     api_key_env: self.openai_key_env.text().to_string(),
                     language: self.openai_lang.text().to_string(),
+                    model: crate::config::default_openai_model(),
                 }),
             },
             ai: AiConfig {
@@ -177,9 +178,16 @@ fn save_from_widgets(widgets: &Widgets, window: Option<&libadwaita::PreferencesW
     let mut config = widgets.read_config();
     let path = Config::config_path();
     // Preserve fields not exposed in the UI (e.g. context_enabled, limits)
-    if let Ok(existing) = Config::load() {
+    if let Ok(existing) = Config::load_from(&path) {
         config.ai.context_enabled = existing.ai.context_enabled;
         config.limits = existing.limits;
+        // The model is not exposed in the UI; keep the configured one.
+        if let (Some(new), Some(old)) = (
+            config.recognition.openai_api.as_mut(),
+            existing.recognition.openai_api,
+        ) {
+            new.model = old.model;
+        }
         config.vad = existing.vad;
     }
     match config.save(&path) {
@@ -212,6 +220,7 @@ fn default_config() -> Config {
             openai_api: Some(OpenAiApiConfig {
                 api_key_env: "OPENAI_API_KEY".to_string(),
                 language: "ja".to_string(),
+                model: crate::config::default_openai_model(),
             }),
         },
         ai: AiConfig {
@@ -387,6 +396,7 @@ fn build_recognition_page(
         .unwrap_or(OpenAiApiConfig {
             api_key_env: "OPENAI_API_KEY".to_string(),
             language: "ja".to_string(),
+            model: crate::config::default_openai_model(),
         });
 
     let openai_key_row = libadwaita::EntryRow::builder()
