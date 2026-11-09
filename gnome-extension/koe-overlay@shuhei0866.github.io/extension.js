@@ -4,6 +4,11 @@
 // a small overlay at the top of the screen while recording / processing /
 // typing. The overlay lives in the Shell's own UI layer and is not reactive,
 // so it never takes keyboard focus from the window koe types into.
+//
+// It also tells the daemon which app has focus (WM_CLASS only, never the
+// window title), because on Wayland the daemon cannot find out itself and
+// needs it to paste with Ctrl+Shift+V into terminals. The daemon accepts
+// this call only from the owner of org.gnome.Shell.
 
 import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
@@ -222,6 +227,11 @@ class KoeOverlay {
 export default class KoeOverlayExtension extends Extension {
     enable() {
         this._overlay = new KoeOverlay();
+        this._cancellable = new Gio.Cancellable();
+        this._lastSentClass = null;
+        this._reportSeq = 0;
+        this._retryId = 0;
+        this._retryCount = 0;
         const bus = Gio.DBus.session;
 
         this._sawStateSignal = false;
@@ -242,10 +252,24 @@ export default class KoeOverlayExtension extends Extension {
                 }
             });
 
+        // When the daemon (re)starts, tell it the current focus again.
         // Hide the overlay if the daemon exits mid-recording.
         this._watchId = Gio.bus_watch_name(
             Gio.BusType.SESSION, BUS_NAME, Gio.BusNameWatcherFlags.NONE,
-            null, () => this._overlay?.hideNow());
+            () => {
+                this._lastSentClass = null;
+                this._sendFocusedApp();
+            },
+            () => {
+                this._lastSentClass = null;
+                this._overlay?.hideNow();
+            });
+
+        this._focusId = global.display.connect('notify::focus-window',
+            () => {
+                this._retryCount = 0;
+                this._sendFocusedApp();
+            });
 
         this._readCurrentState();
     }
@@ -253,7 +277,6 @@ export default class KoeOverlayExtension extends Extension {
     // Signals only report changes, so if the extension is enabled (or the
     // Shell restarts) mid-recording, ask the daemon for its current state.
     _readCurrentState() {
-        this._cancellable = new Gio.Cancellable();
         Gio.DBus.session.call(
             BUS_NAME, OBJECT_PATH, 'org.freedesktop.DBus.Properties', 'Get',
             new GLib.Variant('(ss)', [INTERFACE, 'State']),
@@ -275,7 +298,79 @@ export default class KoeOverlayExtension extends Extension {
             });
     }
 
+    _focusedClass() {
+        return global.display.focus_window?.get_wm_class() ?? '';
+    }
+
+    _sendFocusedApp() {
+        const wmClass = this._focusedClass();
+        if (wmClass === this._lastSentClass)
+            return;
+        this._lastSentClass = wmClass;
+        const seq = ++this._reportSeq;
+        Gio.DBus.session.call(
+            BUS_NAME, OBJECT_PATH, INTERFACE, 'SetFocusedApp',
+            new GLib.Variant('(s)', [wmClass]), null,
+            Gio.DBusCallFlags.NO_AUTO_START, -1, this._cancellable,
+            (conn, result) => {
+                try {
+                    conn.call_finish(result);
+                    if (seq === this._reportSeq)
+                        this._retryCount = 0;
+                } catch (e) {
+                    // A newer report is in flight or already landed; this
+                    // failure must not undo it.
+                    if (seq !== this._reportSeq)
+                        return;
+                    this._lastSentClass = null;
+                    // Daemon not running, an older daemon without the method,
+                    // or cancelled by disable(): wait for the daemon to appear
+                    // or for the next focus change. Otherwise the daemon may
+                    // still hold the previous app, so retry once shortly.
+                    if (e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED) ||
+                        Gio.DBusError.get_remote_error(e)?.endsWith('.ServiceUnknown') ||
+                        Gio.DBusError.get_remote_error(e)?.endsWith('.UnknownMethod'))
+                        return;
+                    this._scheduleRetry();
+                }
+            });
+    }
+
+    _scheduleRetry() {
+        // A few retries cover a busy daemon; give up after that until the
+        // next focus change rather than polling forever.
+        if (this._retryId || this._retryCount >= 3)
+            return;
+        this._retryCount++;
+        this._retryId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1000, () => {
+            this._retryId = 0;
+            this._sendFocusedApp();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
     disable() {
+        if (this._focusId) {
+            global.display.disconnect(this._focusId);
+            this._focusId = 0;
+        }
+        if (this._retryId) {
+            GLib.source_remove(this._retryId);
+            this._retryId = 0;
+        }
+        // Always tell the daemon to forget the focus, so a stale terminal
+        // does not keep Ctrl+Shift+V. Harmless if the daemon is not running.
+        Gio.DBus.session.call(
+            BUS_NAME, OBJECT_PATH, INTERFACE, 'SetFocusedApp',
+            new GLib.Variant('(s)', ['']), null,
+            Gio.DBusCallFlags.NO_AUTO_START, -1, null,
+            (conn, result) => {
+                try {
+                    conn.call_finish(result);
+                } catch {
+                    // Nothing to clean up.
+                }
+            });
         this._cancellable?.cancel();
         this._cancellable = null;
         if (this._signalId) {
