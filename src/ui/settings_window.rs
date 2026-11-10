@@ -34,6 +34,8 @@ fn read_model_selection(combo: &libadwaita::ComboRow, custom: &libadwaita::Entry
 /// All widget handles needed to read settings on save.
 struct Widgets {
     input_config: InputConfig,
+    // Not editable in the UI yet; carried over so saving keeps it.
+    claude_base_url: Option<String>,
     hotkey_mode: libadwaita::ComboRow,
     hotkey_key: libadwaita::EntryRow,
     rec_engine: libadwaita::ComboRow,
@@ -91,6 +93,7 @@ impl Widgets {
                         &self.claude_model_combo,
                         &self.claude_model_custom,
                     ),
+                    base_url: self.claude_base_url.clone(),
                 }),
                 ollama: Some(OllamaConfig {
                     host: self.ollama_host.text().to_string(),
@@ -146,8 +149,14 @@ pub fn build(app: &libadwaita::Application) {
     window.add(&build_mic_test_page());
     window.add(&history_page);
 
+    let claude_config = config
+        .ai
+        .claude
+        .clone()
+        .unwrap_or_else(default_claude_config);
     let widgets = Rc::new(Widgets {
         input_config: config.input.clone(),
+        claude_base_url: claude_config.base_url,
         hotkey_mode,
         hotkey_key,
         rec_engine,
@@ -211,6 +220,14 @@ fn save_from_widgets(widgets: &Widgets, window: Option<&libadwaita::PreferencesW
     }
 }
 
+fn default_claude_config() -> ClaudeConfig {
+    ClaudeConfig {
+        api_key_env: "ANTHROPIC_API_KEY".to_string(),
+        model: "claude-sonnet-5-5".to_string(),
+        base_url: None,
+    }
+}
+
 fn default_config() -> Config {
     Config {
         recognition: RecognitionConfig {
@@ -228,10 +245,7 @@ fn default_config() -> Config {
         ai: AiConfig {
             engine: AiEngine::Claude,
             context_enabled: true,
-            claude: Some(ClaudeConfig {
-                api_key_env: "ANTHROPIC_API_KEY".to_string(),
-                model: "claude-sonnet-5-5".to_string(),
-            }),
+            claude: Some(default_claude_config()),
             ollama: Some(OllamaConfig {
                 host: "http://localhost:11434".to_string(),
                 model: "qwen2.5:14b".to_string(),
@@ -479,10 +493,11 @@ fn build_ai_page(
         .title("Claude")
         .build();
 
-    let cc = config.ai.claude.clone().unwrap_or(ClaudeConfig {
-        api_key_env: "ANTHROPIC_API_KEY".to_string(),
-        model: "claude-sonnet-5-5".to_string(),
-    });
+    let cc = config
+        .ai
+        .claude
+        .clone()
+        .unwrap_or_else(default_claude_config);
 
     let claude_key_row = libadwaita::EntryRow::builder()
         .title("API key env variable")
@@ -540,8 +555,11 @@ fn build_ai_page(
     let claude_combo_for_test = claude_model_combo.clone();
     let claude_custom_for_test = claude_model_custom.clone();
     test_claude_row.connect_activated(move |row| {
-        let api_key_env = claude_key_for_test.text().to_string();
-        let model = read_model_selection(&claude_combo_for_test, &claude_custom_for_test);
+        let claude_config = ClaudeConfig {
+            api_key_env: claude_key_for_test.text().to_string(),
+            model: read_model_selection(&claude_combo_for_test, &claude_custom_for_test),
+            ..cc.clone()
+        };
 
         row.set_subtitle("Testing...");
         let row_clone = row.clone();
@@ -549,7 +567,7 @@ fn build_ai_page(
 
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(test_claude_api(&api_key_env, &model));
+            let _ = tx.send(test_claude_api(&claude_config));
         });
 
         gtk4::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
@@ -737,10 +755,11 @@ fn build_ai_page(
 
 // ─── API Test Functions ─────────────────────────────────────────────────────
 
-fn test_claude_api(api_key_env: &str, model: &str) -> Result<String, String> {
-    let api_key = crate::config::resolve_api_key(api_key_env).map_err(|e| e.to_string())?;
+fn test_claude_api(config: &ClaudeConfig) -> Result<String, String> {
+    let endpoint = crate::ai::claude::messages_url(config).map_err(|e| e.to_string())?;
+    let api_key = crate::config::resolve_api_key(&config.api_key_env).map_err(|e| e.to_string())?;
 
-    crate::ai::claude::test_connectivity(&api_key, model)
+    crate::ai::claude::test_connectivity(&endpoint, &api_key, &config.model)
         .map(|text| truncate(&text, 60).to_string())
         .map_err(|e| e.to_string())
 }

@@ -11,6 +11,38 @@ use super::{build_system_prompt, ConsolidationResult, Learning, ProcessResult, T
 pub const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 
+/// Resolve the Messages API endpoint, honoring a custom base URL.
+pub fn messages_url(config: &ClaudeConfig) -> Result<String> {
+    match &config.base_url {
+        Some(base_url) => anthropic_messages_url(base_url),
+        None => Ok(ANTHROPIC_API_URL.to_string()),
+    }
+}
+
+/// Append the Messages API path to a custom base URL, as the Anthropic SDKs do.
+fn anthropic_messages_url(base_url: &str) -> Result<String> {
+    let url = reqwest::Url::parse(base_url)
+        .with_context(|| format!("invalid ai.claude.base_url: {:?}", base_url))?;
+    // The API key travels with every request; allow plain HTTP only to this machine.
+    let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+    if !(url.scheme() == "https" || url.scheme() == "http" && loopback) {
+        anyhow::bail!(
+            "ai.claude.base_url must use https (http is allowed only for localhost): {:?}",
+            base_url
+        );
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        anyhow::bail!(
+            "ai.claude.base_url must not have a query or fragment: {:?}",
+            base_url
+        );
+    }
+    Ok(format!(
+        "{}/v1/messages",
+        url.as_str().trim_end_matches('/')
+    ))
+}
+
 /// Read the response body as JSON, enforcing a maximum size limit.
 ///
 /// Uses chunk-based streaming so that a response without Content-Length
@@ -50,6 +82,7 @@ pub(crate) async fn read_response_json(
 }
 
 pub struct ClaudeProcessor {
+    endpoint: String,
     api_key: String,
     model: String,
     client: reqwest::Client,
@@ -58,9 +91,11 @@ pub struct ClaudeProcessor {
 
 impl ClaudeProcessor {
     pub fn new(config: &ClaudeConfig, max_response_bytes: usize) -> Result<Self> {
+        let endpoint = messages_url(config)?;
         let api_key = crate::config::resolve_api_key(&config.api_key_env)?;
 
         Ok(Self {
+            endpoint,
             api_key,
             model: config.model.clone(),
             client: reqwest::Client::builder()
@@ -87,13 +122,14 @@ impl ClaudeProcessor {
             .context("sending request to Claude API")?;
         if !response.status().is_success() {
             let status = response.status();
+            let host = response.url().host_str().unwrap_or_default().to_string();
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("Claude API error ({}): {}", status, body);
+            anyhow::bail!("Claude API error ({}) from {}: {}", status, host, body);
         }
         read_response_json(response, self.max_response_bytes).await
     }
 
-    // The production entry point always supplies ANTHROPIC_API_URL. Keeping the
+    // The production entry point always supplies self.endpoint. Keeping the
     // transport boundary here lets regression tests exercise the entire exchange.
     async fn process_at_endpoint(
         &self,
@@ -406,7 +442,7 @@ pub fn parse_consolidation_response(text: &str) -> Result<ConsolidationResult> {
 
 /// Send a minimal test request to verify API key and model.
 /// Returns the model's response text on success.
-pub fn test_connectivity(api_key: &str, model: &str) -> Result<String> {
+pub fn test_connectivity(endpoint: &str, api_key: &str, model: &str) -> Result<String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
@@ -425,7 +461,7 @@ pub fn test_connectivity(api_key: &str, model: &str) -> Result<String> {
     apply_model_settings(&mut body);
 
     let response = client
-        .post(ANTHROPIC_API_URL)
+        .post(endpoint)
         .header("x-api-key", api_key)
         .header("anthropic-version", ANTHROPIC_VERSION)
         .header("content-type", "application/json")
@@ -435,8 +471,9 @@ pub fn test_connectivity(api_key: &str, model: &str) -> Result<String> {
 
     let status = response.status();
     if !status.is_success() {
+        let host = response.url().host_str().unwrap_or_default().to_string();
         let body = response.text().unwrap_or_default();
-        anyhow::bail!("API error ({}): {}", status, body);
+        anyhow::bail!("API error ({}) from {}: {}", status, host, body);
     }
 
     let resp: serde_json::Value = response.json().context("parsing Claude response")?;
@@ -458,7 +495,7 @@ impl TextProcessor for ClaudeProcessor {
                 context,
                 dictionary,
                 memory_context,
-                ANTHROPIC_API_URL,
+                &self.endpoint,
             )
             .await?;
 
@@ -486,7 +523,7 @@ impl TextProcessor for ClaudeProcessor {
 
         let response = self
             .client
-            .post(ANTHROPIC_API_URL)
+            .post(&self.endpoint)
             // Consolidation can summarize a large memory; keep a bounded but
             // longer deadline than interactive dictation requests.
             .timeout(std::time::Duration::from_secs(120))
@@ -500,8 +537,14 @@ impl TextProcessor for ClaudeProcessor {
 
         if !response.status().is_success() {
             let status = response.status();
+            let host = response.url().host_str().unwrap_or_default().to_string();
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("Claude consolidation error ({}): {}", status, body);
+            anyhow::bail!(
+                "Claude consolidation error ({}) from {}: {}",
+                status,
+                host,
+                body
+            );
         }
 
         let resp = read_response_json(response, self.max_response_bytes).await?;
@@ -585,6 +628,7 @@ mod exchange_tests {
 
     fn processor() -> ClaudeProcessor {
         ClaudeProcessor {
+            endpoint: ANTHROPIC_API_URL.into(),
             api_key: "synthetic-test-key".into(),
             model: "claude-sonnet-5-5".into(),
             client: reqwest::Client::builder().no_proxy().build().unwrap(),
@@ -764,6 +808,62 @@ mod exchange_tests {
         let older = build_request_body("claude-sonnet-4-6", "system", "input", None);
         assert!(older.get("thinking").is_none());
         assert!(older.get("output_config").is_none());
+    }
+
+    fn with_base_url(base_url: Option<&str>) -> ClaudeConfig {
+        ClaudeConfig {
+            api_key_env: "SYNTHETIC_KEY".into(),
+            model: "claude-sonnet-5-5".into(),
+            base_url: base_url.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn messages_url_defaults_to_the_anthropic_api() {
+        assert_eq!(
+            messages_url(&with_base_url(None)).unwrap(),
+            ANTHROPIC_API_URL
+        );
+    }
+
+    #[test]
+    fn base_url_gets_the_messages_path() {
+        for (base_url, expected) in [
+            (
+                "https://llm.example.com",
+                "https://llm.example.com/v1/messages",
+            ),
+            (
+                "https://llm.example.com/",
+                "https://llm.example.com/v1/messages",
+            ),
+            (
+                "https://llm.example.com/anthropic/",
+                "https://llm.example.com/anthropic/v1/messages",
+            ),
+            ("http://localhost:8080", "http://localhost:8080/v1/messages"),
+        ] {
+            assert_eq!(
+                messages_url(&with_base_url(Some(base_url))).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn base_url_rejects_unsafe_or_ambiguous_urls() {
+        for base_url in [
+            "http://llm.example.com",
+            "llm.example.com",
+            "ftp://llm.example.com",
+            "https://llm.example.com/?key=x",
+            "https://llm.example.com/#x",
+        ] {
+            assert!(
+                messages_url(&with_base_url(Some(base_url))).is_err(),
+                "{base_url}"
+            );
+        }
     }
 
     #[test]
@@ -1133,7 +1233,7 @@ mod tests {
         let api_key = crate::config::resolve_api_key("ANTHROPIC_API_KEY")
             .expect("ANTHROPIC_API_KEY must be available (env or keyring)");
 
-        let result = test_connectivity(&api_key, "claude-sonnet-4-6");
+        let result = test_connectivity(ANTHROPIC_API_URL, &api_key, "claude-sonnet-4-6");
         match &result {
             Ok(text) => println!("Claude responded: {}", text),
             Err(e) => panic!("Claude API test failed: {}", e),
@@ -1149,7 +1249,7 @@ mod tests {
         let api_key = crate::config::resolve_api_key("ANTHROPIC_API_KEY")
             .expect("ANTHROPIC_API_KEY must be available (env or keyring)");
 
-        let result = test_connectivity(&api_key, "claude-sonnet-4-6");
+        let result = test_connectivity(ANTHROPIC_API_URL, &api_key, "claude-sonnet-4-6");
         match &result {
             Ok(text) => println!("claude-sonnet-4-6 OK: {}", text),
             Err(e) => println!("claude-sonnet-4-6 FAILED: {}", e),
