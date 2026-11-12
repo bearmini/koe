@@ -81,6 +81,12 @@ pub(crate) async fn read_response_json(
     serde_json::from_slice(&buf).context("parsing API response JSON")
 }
 
+/// Never follow redirects: reqwest keeps `x-api-key` on a redirect to another
+/// host, so following one could send the key past the `base_url` checks.
+fn http_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
+}
+
 pub struct ClaudeProcessor {
     endpoint: String,
     api_key: String,
@@ -98,7 +104,7 @@ impl ClaudeProcessor {
             endpoint,
             api_key,
             model: config.model.clone(),
-            client: reqwest::Client::builder()
+            client: http_client_builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .context("building Claude HTTP client")?,
@@ -444,6 +450,8 @@ pub fn parse_consolidation_response(text: &str) -> Result<ConsolidationResult> {
 /// Returns the model's response text on success.
 pub fn test_connectivity(endpoint: &str, api_key: &str, model: &str) -> Result<String> {
     let client = reqwest::blocking::Client::builder()
+        // See http_client_builder.
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .context("building HTTP client")?;
@@ -559,8 +567,57 @@ impl TextProcessor for ClaudeProcessor {
 mod exchange_tests {
     use super::*;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::time::{Duration, Instant};
+
+    fn accept(listener: &TcpListener) -> TcpStream {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("expected API request: {e}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+    }
+
+    /// Read one request and return its body.
+    fn read_request(stream: &mut TcpStream) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let (header_end, length) = loop {
+            let mut buffer = [0; 4096];
+            let count = stream.read(&mut buffer).unwrap();
+            assert!(count > 0);
+            bytes.extend_from_slice(&buffer[..count]);
+            if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&bytes[..end]);
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap();
+                break (end + 4, length);
+            }
+        };
+        while bytes.len() < header_end + length {
+            let mut buffer = [0; 4096];
+            let count = stream.read(&mut buffer).unwrap();
+            assert!(count > 0);
+            bytes.extend_from_slice(&buffer[..count]);
+        }
+        bytes[header_end..header_end + length].to_vec()
+    }
 
     fn mock_api(
         responses: Vec<(u16, serde_json::Value)>,
@@ -571,49 +628,8 @@ mod exchange_tests {
         let handle = std::thread::spawn(move || {
             let mut requests = Vec::new();
             for (status, response) in responses {
-                let deadline = Instant::now() + Duration::from_secs(5);
-                let mut stream = loop {
-                    match listener.accept() {
-                        Ok((stream, _)) => break stream,
-                        Err(e)
-                            if e.kind() == std::io::ErrorKind::WouldBlock
-                                && Instant::now() < deadline =>
-                        {
-                            std::thread::sleep(Duration::from_millis(5));
-                        }
-                        Err(e) => panic!("expected API request: {e}"),
-                    }
-                };
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                let mut bytes = Vec::new();
-                let (header_end, length) = loop {
-                    let mut buffer = [0; 4096];
-                    let count = stream.read(&mut buffer).unwrap();
-                    assert!(count > 0);
-                    bytes.extend_from_slice(&buffer[..count]);
-                    if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
-                        let headers = String::from_utf8_lossy(&bytes[..end]);
-                        let length = headers
-                            .lines()
-                            .find_map(|line| {
-                                let (key, value) = line.split_once(':')?;
-                                key.eq_ignore_ascii_case("content-length")
-                                    .then(|| value.trim().parse::<usize>().unwrap())
-                            })
-                            .unwrap();
-                        break (end + 4, length);
-                    }
-                };
-                while bytes.len() < header_end + length {
-                    let mut buffer = [0; 4096];
-                    let count = stream.read(&mut buffer).unwrap();
-                    assert!(count > 0);
-                    bytes.extend_from_slice(&buffer[..count]);
-                }
-                requests
-                    .push(serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap());
+                let mut stream = accept(&listener);
+                requests.push(serde_json::from_slice(&read_request(&mut stream)).unwrap());
                 if status == 0 {
                     std::thread::sleep(Duration::from_millis(500));
                     continue;
@@ -631,9 +647,68 @@ mod exchange_tests {
             endpoint: ANTHROPIC_API_URL.into(),
             api_key: "synthetic-test-key".into(),
             model: "claude-sonnet-5-5".into(),
-            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            client: http_client_builder().no_proxy().build().unwrap(),
             max_response_bytes: 1024 * 1024,
         }
+    }
+
+    /// Answer one request with a 307 to a second listener, and return the first
+    /// endpoint and the second listener, which must never receive a connection.
+    fn redirect_to_another_host() -> (String, TcpListener, std::thread::JoinHandle<()>) {
+        let target = TcpListener::bind("127.0.0.1:0").unwrap();
+        target.set_nonblocking(true).unwrap();
+        let location = format!("http://{}/v1/messages", target.local_addr().unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}/v1/messages", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let mut stream = accept(&listener);
+            read_request(&mut stream);
+            write!(stream, "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        });
+        (endpoint, target, handle)
+    }
+
+    fn assert_never_contacted(target: &TcpListener) {
+        assert!(matches!(
+            target.accept(),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[tokio::test]
+    async fn processing_does_not_follow_redirects_with_the_api_key() {
+        let (endpoint, target, server) = redirect_to_another_host();
+        let mut processor = processor();
+        // The target never answers; time out instead of hanging if it is reached.
+        processor.client = http_client_builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let error = processor
+            .process_at_endpoint(
+                "合成入力",
+                &WindowContext::default(),
+                &Dictionary::default(),
+                "",
+                &endpoint,
+            )
+            .await
+            .unwrap_err();
+        server.join().unwrap();
+        assert!(error.to_string().contains("307"), "{error}");
+        assert_never_contacted(&target);
+    }
+
+    #[test]
+    fn connection_test_does_not_follow_redirects_with_the_api_key() {
+        let (endpoint, target, server) = redirect_to_another_host();
+        let error =
+            test_connectivity(&endpoint, "synthetic-test-key", "claude-sonnet-5-5").unwrap_err();
+        server.join().unwrap();
+        assert!(error.to_string().contains("307"), "{error}");
+        assert_never_contacted(&target);
     }
 
     fn tool_turn() -> serde_json::Value {
