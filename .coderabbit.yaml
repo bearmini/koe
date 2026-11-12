@@ -1,0 +1,46 @@
+# yaml-language-server: $schema=https://www.coderabbit.ai/integrations/schema.v2.json
+language: ja-JP
+tone_instructions: >-
+  根拠と発生条件を具体的に示し、実際の不具合と任意の改善提案を区別してください。
+  コントリビューターへ敬意を持って、簡潔で建設的に伝えてください。
+
+reviews:
+  profile: chill
+  auto_approvals:
+    enabled: false
+  high_level_summary_in_walkthrough: true
+  review_status: true
+  review_info: true
+  commit_status: true
+  fail_commit_status: true
+  poem: false
+  in_progress_fortune: false
+  auto_review:
+    enabled: true
+    auto_incremental_review: true
+    drafts: false
+  path_instructions:
+    - path: "src/**/*.rs"
+      instructions: >-
+        Linux向け音声入力アプリとしてレビューしてください。録音・非同期処理中の
+        イベントループのブロック、二重起動、X11/Waylandでの入力先とフォーカス、
+        失敗時の状態復帰に注意してください。実APIや実マイクが必要な確認と、
+        モックで検証できる確認を区別してください。
+    - path: "src/ai/**"
+      instructions: >-
+        APIキーと利用者の音声由来テキストの送信先、リダイレクト、タイムアウト、
+        応答サイズ制限、通常処理と接続テストの整合性を確認してください。
+        学習ツール呼び出し後の会話継続と、成功前に学習結果を保存しないことも確認してください。
+    - path: "src/config.rs"
+      instructions: >-
+        既存設定との後方互換性、serdeの既定値、保存と再読込の往復での値の保持を確認してください。
+        新しい設定値が設定UIの保存で失われないか、src/ui/settings_window.rsも照合してください。
+    - path: "src/ui/**"
+      instructions: >-
+        GUI機能を有効にしたビルドを前提に、保存時の設定保持、UIスレッドでの
+        ブロッキング処理、接続テストと実際の処理の設定の一致を確認してください。
+    - path: ".github/workflows/**"
+      instructions: >-
+        forkからのpull_requestでも、秘密や書き込み権限なしで検証できるか確認してください。
+        外部PRのコードをpull_request_targetやself-hosted runnerで実行しないこと、
+        ActionのSHA固定、公開権限がタグからのリリース処理だけに限定されることを確認してください。

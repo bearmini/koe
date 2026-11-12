@@ -16,15 +16,22 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
     name: Build and release
     # Built on 24.04 so the binary and the .deb dependencies also work on newer Ubuntu.
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
       - name: Install system dependencies
         run: |
@@ -61,13 +68,26 @@ jobs:
             ${{ env.ARCHIVE }}.sha256
             ${{ env.DEB }}
             ${{ env.DEB }}.sha256
+  publish:
+    name: Publish release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Download packages from this run
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: koe-packages
+          path: packages
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           generate_release_notes: true
           files: |
-            ${{ env.ARCHIVE }}
-            ${{ env.ARCHIVE }}.sha256
-            ${{ env.DEB }}
-            ${{ env.DEB }}.sha256
+            packages/*.tar.gz
+            packages/*.tar.gz.sha256
+            packages/*.deb
+            packages/*.deb.sha256
