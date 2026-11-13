@@ -81,10 +81,24 @@ pub(crate) async fn read_response_json(
     serde_json::from_slice(&buf).context("parsing API response JSON")
 }
 
+fn is_loopback_http(endpoint: &str) -> bool {
+    reqwest::Url::parse(endpoint).is_ok_and(|url| {
+        url.scheme() == "http"
+            && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
+    })
+}
+
 /// Never follow redirects: reqwest keeps `x-api-key` on a redirect to another
 /// host, so following one could send the key past the `base_url` checks.
-fn http_client_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
+fn http_client_builder(endpoint: &str) -> reqwest::ClientBuilder {
+    let builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+    // Plain HTTP is permitted only for local traffic. An environment proxy
+    // would send the API key and transcript outside that boundary.
+    if is_loopback_http(endpoint) {
+        builder.no_proxy()
+    } else {
+        builder
+    }
 }
 
 pub struct ClaudeProcessor {
@@ -100,14 +114,15 @@ impl ClaudeProcessor {
         let endpoint = messages_url(config)?;
         let api_key = crate::config::resolve_api_key(&config.api_key_env)?;
 
+        let client = http_client_builder(&endpoint)
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .context("building Claude HTTP client")?;
         Ok(Self {
             endpoint,
             api_key,
             model: config.model.clone(),
-            client: http_client_builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .context("building Claude HTTP client")?,
+            client,
             max_response_bytes,
         })
     }
@@ -449,12 +464,16 @@ pub fn parse_consolidation_response(text: &str) -> Result<ConsolidationResult> {
 /// Send a minimal test request to verify API key and model.
 /// Returns the model's response text on success.
 pub fn test_connectivity(endpoint: &str, api_key: &str, model: &str) -> Result<String> {
-    let client = reqwest::blocking::Client::builder()
+    let builder = reqwest::blocking::Client::builder()
         // See http_client_builder.
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .context("building HTTP client")?;
+        .timeout(std::time::Duration::from_secs(15));
+    let builder = if is_loopback_http(endpoint) {
+        builder.no_proxy()
+    } else {
+        builder
+    };
+    let client = builder.build().context("building HTTP client")?;
 
     let mut body = json!({
         "model": model,
@@ -647,7 +666,10 @@ mod exchange_tests {
             endpoint: ANTHROPIC_API_URL.into(),
             api_key: "synthetic-test-key".into(),
             model: "claude-sonnet-5-5".into(),
-            client: http_client_builder().no_proxy().build().unwrap(),
+            client: http_client_builder(ANTHROPIC_API_URL)
+                .no_proxy()
+                .build()
+                .unwrap(),
             max_response_bytes: 1024 * 1024,
         }
     }
@@ -681,7 +703,7 @@ mod exchange_tests {
         let (endpoint, target, server) = redirect_to_another_host();
         let mut processor = processor();
         // The target never answers; time out instead of hanging if it is reached.
-        processor.client = http_client_builder()
+        processor.client = http_client_builder(&endpoint)
             .no_proxy()
             .timeout(Duration::from_secs(2))
             .build()
@@ -709,6 +731,130 @@ mod exchange_tests {
         server.join().unwrap();
         assert!(error.to_string().contains("307"), "{error}");
         assert_never_contacted(&target);
+    }
+
+    // Run the real entry points in child processes so proxy environment changes
+    // cannot race with other tests or depend on the developer's proxy settings.
+    #[test]
+    fn loopback_proxy_child() {
+        let Ok(mode) = std::env::var("KOE_TEST_PROXY_MODE") else {
+            return;
+        };
+        let base_url = std::env::var("KOE_TEST_BASE_URL").unwrap();
+        let config = ClaudeConfig {
+            api_key_env: "KOE_TEST_SYNTHETIC_KEY".into(),
+            model: "claude-sonnet-5-5".into(),
+            base_url: Some(base_url),
+        };
+        if mode == "processing" {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let result = runtime.block_on(async {
+                ClaudeProcessor::new(&config, 1024 * 1024)
+                    .unwrap()
+                    .process(
+                        "synthetic speech",
+                        &WindowContext::default(),
+                        &Dictionary::default(),
+                        "",
+                    )
+                    .await
+                    .unwrap()
+            });
+            assert_eq!(result.text, "OK");
+        } else {
+            assert_eq!(
+                test_connectivity(
+                    &messages_url(&config).unwrap(),
+                    "synthetic-proxy-test-key",
+                    &config.model,
+                )
+                .unwrap(),
+                "OK"
+            );
+        }
+    }
+
+    fn optional_api() -> (String, std::thread::JoinHandle<bool>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let handle = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(3)))
+                            .unwrap();
+                        read_request(&mut stream);
+                        let body = r#"{"content":[{"type":"text","text":"OK"}]}"#;
+                        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                        return true;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return false;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accepting synthetic request: {error}"),
+                }
+            }
+        });
+        (base_url, handle)
+    }
+
+    fn assert_loopback_bypasses_environment_proxy(mode: &str) {
+        let (origin, origin_server) = optional_api();
+        let (proxy, proxy_server) = optional_api();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child.args([
+            "--exact",
+            "ai::claude::exchange_tests::loopback_proxy_child",
+            "--nocapture",
+        ]);
+        for name in [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ] {
+            child.env(name, &proxy);
+        }
+        child.env_remove("NO_PROXY").env_remove("no_proxy");
+        let output = child
+            .env("KOE_TEST_PROXY_MODE", mode)
+            .env("KOE_TEST_BASE_URL", origin)
+            .env("KOE_TEST_SYNTHETIC_KEY", "synthetic-proxy-test-key")
+            .output()
+            .unwrap();
+        let origin_contacted = origin_server.join().unwrap();
+        let proxy_contacted = proxy_server.join().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            !proxy_contacted,
+            "loopback HTTP sent the request through an environment proxy"
+        );
+        assert!(
+            origin_contacted,
+            "loopback HTTP did not reach the local origin"
+        );
+    }
+
+    #[test]
+    fn processing_loopback_bypasses_environment_proxy() {
+        assert_loopback_bypasses_environment_proxy("processing");
+    }
+
+    #[test]
+    fn connectivity_loopback_bypasses_environment_proxy() {
+        assert_loopback_bypasses_environment_proxy("connectivity");
     }
 
     fn tool_turn() -> serde_json::Value {

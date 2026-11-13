@@ -189,17 +189,7 @@ fn save_from_widgets(widgets: &Widgets, window: Option<&libadwaita::PreferencesW
     let path = Config::config_path();
     // Preserve fields not exposed in the UI (e.g. context_enabled, limits)
     if let Ok(existing) = Config::load_from(&path) {
-        config.ai.context_enabled = existing.ai.context_enabled;
-        config.limits = existing.limits;
-        // The model is not exposed in the UI; keep the configured one.
-        if let (Some(new), Some(old)) = (
-            config.recognition.openai_api.as_mut(),
-            existing.recognition.openai_api,
-        ) {
-            new.model = old.model;
-        }
-        config.vad = existing.vad;
-        config.live = existing.live;
+        config = preserve_unexposed_config(config, existing);
     }
     match config.save(&path) {
         Ok(()) => {
@@ -218,6 +208,26 @@ fn save_from_widgets(widgets: &Widgets, window: Option<&libadwaita::PreferencesW
             false
         }
     }
+}
+
+fn preserve_unexposed_config(mut config: Config, existing: Config) -> Config {
+    // base_url has no widget. Preserve the latest file value, including removal,
+    // rather than the snapshot taken when the settings window opened.
+    if let Some(claude) = config.ai.claude.as_mut() {
+        claude.base_url = existing.ai.claude.and_then(|old| old.base_url);
+    }
+    config.ai.context_enabled = existing.ai.context_enabled;
+    config.limits = existing.limits;
+    // The model is not exposed in the UI; keep the configured one.
+    if let (Some(new), Some(old)) = (
+        config.recognition.openai_api.as_mut(),
+        existing.recognition.openai_api,
+    ) {
+        new.model = old.model;
+    }
+    config.vad = existing.vad;
+    config.live = existing.live;
+    config
 }
 
 fn default_claude_config() -> ClaudeConfig {
@@ -975,4 +985,39 @@ fn remove_autostart_entry() -> anyhow::Result<()> {
         std::fs::remove_file(&path)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod base_url_save_tests {
+    use super::*;
+
+    #[test]
+    fn saving_preserves_latest_file_base_url_and_widget_edits() {
+        for (snapshot, latest) in [
+            (None, Some("https://new.example")),
+            (Some("https://old.example"), Some("https://new.example")),
+            (Some("https://old.example"), None),
+        ] {
+            let mut widgets_config = default_config();
+            let claude = widgets_config.ai.claude.as_mut().unwrap();
+            claude.base_url = snapshot.map(String::from);
+            claude.model = "model-from-widget".into();
+            claude.api_key_env = "KEY_FROM_WIDGET".into();
+            let mut file_config = default_config();
+            file_config.ai.claude.as_mut().unwrap().base_url = latest.map(String::from);
+
+            let path = std::env::temp_dir()
+                .join(format!("koe-base-url-save-{}.toml", uuid::Uuid::new_v4()));
+            file_config.save(&path).unwrap();
+            let merged =
+                preserve_unexposed_config(widgets_config, Config::load_from(&path).unwrap());
+            merged.save(&path).unwrap();
+            let saved = Config::load_from(&path).unwrap().ai.claude.unwrap();
+            std::fs::remove_file(path).unwrap();
+
+            assert_eq!(saved.base_url.as_deref(), latest);
+            assert_eq!(saved.model, "model-from-widget");
+            assert_eq!(saved.api_key_env, "KEY_FROM_WIDGET");
+        }
+    }
 }
