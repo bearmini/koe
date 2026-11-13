@@ -7,18 +7,28 @@ on:
     branches: [main]
   schedule:
     - cron: '0 0 * * 1'
+  workflow_dispatch:
 
-permissions: {}
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   audit:
     name: cargo audit
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      issues: write
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      # Use the CLI so fork PRs need no checks:write or issues:write token.
+      # Vulnerabilities fail the job; maintenance notices remain visible in its log.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Audit dependencies
+        run: cargo audit
